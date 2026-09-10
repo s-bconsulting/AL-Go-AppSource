@@ -1,0 +1,88 @@
+name: Update AppSource App For Customer
+
+on:
+  workflow_dispatch:
+    inputs:
+      customerGitHubEnvironment:
+        description: Name of the GitHub Environment holding this customer's AUTHCONTEXT secret
+        required: true
+      bcEnvironmentName:
+        description: Name of the Business Central environment on the customer's tenant
+        required: true
+      appIds:
+        description: App ID(s) (GUID) of the AppSource app(s) to update, comma-separated for multiple apps
+        required: true
+      targetVersion:
+        description: Version to update to, or 'latest' to use the newest available version. Ignored (always 'latest' per app) when multiple appIds are given.
+        required: false
+        default: 'latest'
+      useEnvironmentUpdateWindow:
+        description: Defer the update to the environment's own maintenance window instead of applying immediately
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  UpdateApp:
+    runs-on: windows-latest
+    environment: ${{ inputs.customerGitHubEnvironment }}
+    steps:
+      - name: Update AppSource app on customer environment
+        shell: pwsh
+        env:
+          AUTHCONTEXT: ${{ secrets.AUTHCONTEXT }}
+        run: |
+          $errorActionPreference = "Stop"
+          $ProgressPreference = "SilentlyContinue"
+
+          $bcEnvironmentName = "${{ inputs.bcEnvironmentName }}"
+          $appIds = "${{ inputs.appIds }}".Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+          $requestedVersion = "${{ inputs.targetVersion }}"
+          $useEnvironmentUpdateWindow = [bool]::Parse("${{ inputs.useEnvironmentUpdateWindow }}")
+          $apiVersion = "v2.29"
+
+          if ($appIds.Count -gt 1 -and $requestedVersion -ne 'latest') {
+              Write-Host "::Warning::Multiple appIds given, ignoring targetVersion '$requestedVersion' and using 'latest' for each app individually"
+              $requestedVersion = 'latest'
+          }
+
+          $authContextParams = $env:AUTHCONTEXT | ConvertFrom-Json -AsHashtable
+
+          $webClient = New-Object System.Net.WebClient
+          $webClient.DownloadFile('https://raw.githubusercontent.com/microsoft/AL-Go-Actions/v9.2/AL-Go-Helper.ps1', "$env:TEMP\AL-Go-Helper.ps1")
+          . "$env:TEMP\AL-Go-Helper.ps1" -local
+          DownloadAndImportBcContainerHelper
+
+          $bcAuthContext = New-BcAuthContext @authContextParams
+          $headers = @{ "Authorization" = "Bearer $($bcAuthContext.AccessToken)" }
+          $baseUri = "https://api.businesscentral.dynamics.com/admin/$apiVersion/applications/BusinessCentral/environments/$bcEnvironmentName/apps"
+
+          foreach ($appId in $appIds) {
+              $bcAuthContext = Renew-BcAuthContext -bcAuthContext $bcAuthContext
+              $headers = @{ "Authorization" = "Bearer $($bcAuthContext.AccessToken)" }
+
+              $targetVersion = $requestedVersion
+              if ($targetVersion -eq 'latest') {
+                  Write-Host "Looking up available updates for app $appId on $bcEnvironmentName..."
+                  $updates = Invoke-RestMethod -Method Get -Uri "$baseUri/availableUpdates" -Headers $headers
+                  $update = $updates.value | Where-Object { $_.appId -eq $appId }
+                  if (-not $update) {
+                      Write-Host "::Warning::No available update found for app $appId on environment $bcEnvironmentName. It may already be up to date, or the appId may be incorrect. Skipping."
+                      continue
+                  }
+                  $targetVersion = $update.version
+                  Write-Host "Latest available version for $appId : $targetVersion"
+              }
+
+              $body = @{
+                  "useEnvironmentUpdateWindow" = $useEnvironmentUpdateWindow
+                  "targetVersion" = $targetVersion
+                  "installOrUpdateNeededDependencies" = $true
+              } | ConvertTo-Json
+
+              Write-Host "Requesting update of app $appId to version $targetVersion on $bcEnvironmentName (useEnvironmentUpdateWindow = $useEnvironmentUpdateWindow)"
+              $result = Invoke-RestMethod -Method Post -Uri "$baseUri/$appId/update" -Headers $headers -ContentType "application/json" -Body $body
+              $result | ConvertTo-Json -Depth 5 | Write-Host
+          }
