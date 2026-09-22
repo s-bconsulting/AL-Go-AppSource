@@ -9,6 +9,7 @@
   "bcptTestFolders": [],
   "versioningStrategy": 3,
   "versionBCPreserve": false,
+  "versionBCMarker": 0,
   "DeployTo<EnvironmentName>": {
     "deploymentSchedule": "Immediate",
     "deployAfterRelease": false
